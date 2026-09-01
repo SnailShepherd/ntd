@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NTD builder — рабочая, самодостаточная версия (cp1251, порядок фильтров, STRICT по классификаторам по умолчанию).
+NTD builder, версия 2026.02 (cp1251, порядок фильтров, STRICT по классификаторам по умолчанию).
 
 Что делает:
   • Читает входные HTML-таблицы (2 или 3 колонки):
@@ -25,6 +25,7 @@ NTD builder — рабочая, самодостаточная версия (cp1
 
 from __future__ import annotations
 import argparse
+import calendar
 import dataclasses
 import html
 import json
@@ -39,6 +40,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
+
+VERSION = "2026.02"
 
 # ---------------------
 # Константы и настройки
@@ -116,6 +119,14 @@ HIGH_VOLUME_ORGS_GENITIVE = {
     "Росимущество": "Росимущества",
     "Росгвардия": "Росгвардии",
     "Росстат": "Росстата",
+    "Росаккредитация": "Росаккредитации",
+    "Росавиация": "Росавиации",
+    "Росжелдор": "Росжелдора",
+    "Роспатент": "Роспатента",
+    "Россельхознадзор": "Россельхознадзора",
+    "Минспорт России": "Минспорта России",
+    "Минцифры России": "Минцифры России",
+    "ФМБА России": "ФМБА России",
     "ФНС России": "ФНС России",
     "ФТС России": "ФТС России",
     "ФАС России (Федеральная антимонопольная служба)": "ФАС России",
@@ -147,7 +158,7 @@ ORG_FILTER_ALLOWLIST: Set[str] = set()
 ORG_FILTER_BLOCKLIST: Set[str] = {"ФГБУ \"ФЦАО\""}
 
 HTTP_HEADERS = {
-    "User-Agent": "NTD builder (normacs helper) / 1.5",
+    "User-Agent": f"NTD builder (normacs helper) / {VERSION}",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -255,6 +266,16 @@ def parse_iso_date(s: str) -> Optional[date]:
         except ValueError:
             pass
     return None
+
+
+def months_back(d: date, months: int) -> date:
+    """Дата на N месяцев раньше d. Если такого числа в целевом месяце нет,
+    берём последнее число месяца (31 августа − 6 мес. → 28/29 февраля)."""
+    total = d.year * 12 + (d.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
 
 
 def parse_years_csv(s: str) -> Set[int]:
@@ -365,10 +386,19 @@ def load_classifiers_map(map_path: Path) -> List[Tuple[re.Pattern, str]]:
     start = 1 if p_idx is not None and c_idx is not None else 0
     if p_idx is None or c_idx is None:
         p_idx, c_idx, start = 0, 1, 0
+    expected_len = len(header) if start == 1 else None
     rules: List[Tuple[re.Pattern, str]] = []
-    for r in rows[start:]:
+    for line_no, r in enumerate(rows[start:], start=start + 1):
         if max(p_idx, c_idx) >= len(r):
             continue
+        if expected_len is not None and len(r) != expected_len:
+            print(
+                f"[WARN] classifiers_map: строка {line_no} содержит {len(r)} колонок вместо {expected_len} "
+                f"— похоже, в pattern/canonical_label есть незаэкранированная запятая. "
+                f"Оберните значение целиком в двойные кавычки, например: \"^\\s*13\\b.*,.*\",Название,alias. "
+                f"Разобрано как: {r}",
+                file=sys.stderr,
+            )
         patt = (r[p_idx] or "").strip()
         canon = (r[c_idx] or "").strip()
         if not patt or not canon:
@@ -406,10 +436,14 @@ def read_html_best_effort(file_path: Path) -> str:
 
 
 def extract_folder_tokens(folders_html: str) -> List[str]:
-    """Достаём метки из колонки «Папки». Разделители: '/', ';', ',', '•', '·', '|', '>'."""
+    """Достаём метки из колонки «Папки». Разделители: '/', ';', '•', '·', '|', '>'.
+    Запятая НЕ разделитель: она входит в сами названия классификаторов
+    («Контроль качества, сертификация», «к.56 Окна, двери, ворота и приборы к ним»,
+    ICS «13 ОХРАНА ОКРУЖАЮЩЕЙ СРЕДЫ, ЗАЩИТА ЧЕЛОВЕКА...»). Резка по запятой
+    обрезала метки до первого фрагмента и путала разные классификаторы между собой."""
     txt = BeautifulSoup(folders_html or "", "html.parser").get_text(" / ")
-    txt = re.sub(r"[ \u00A0]+", " ", txt).strip()
-    parts = re.split(r"[\/;\,\|\u2022\u00B7>]+", txt)
+    txt = re.sub(r"[  ]+", " ", txt).strip()
+    parts = re.split(r"[\/;\|•·>]+", txt)
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -644,6 +678,102 @@ def build_content_block(card: CardInfo) -> str:
 
 
 
+def _file_age_days(p: Path, today: date) -> Optional[int]:
+    """Возраст файла в днях. Для таблиц берём дату из имени (YYYYMMDD*.html) —
+    она смысловая; если её нет, откатываемся на время изменения файла."""
+    d = parse_file_date_from_name(p)
+    if d is None:
+        try:
+            d = datetime.fromtimestamp(p.stat().st_mtime).date()
+        except OSError:
+            return None
+    return (today - d).days
+
+
+def prune_dir(
+    directory: Path,
+    pattern: str,
+    keep_days: Optional[int],
+    keep_max: Optional[int],
+    label: str,
+    dry: bool,
+) -> int:
+    """Чистим папку: удаляем всё старше keep_days и/или оставляем только keep_max
+    самых свежих файлов. Возвращаем число удалённых (или, в режиме dry, — сколько
+    было бы удалено). Ничего не делаем, если оба ограничения не заданы."""
+    if keep_days is None and keep_max is None:
+        return 0
+    if not directory.is_dir():
+        return 0
+
+    files = sorted(directory.glob(pattern))
+    if not files:
+        return 0
+
+    today = date.today()
+    doomed: Set[Path] = set()
+
+    if keep_days is not None:
+        for f in files:
+            age = _file_age_days(f, today)
+            if age is not None and age > keep_days:
+                doomed.add(f)
+
+    if keep_max is not None and len(files) > keep_max:
+        # свежие — в конец: сортируем тем же ключом, что и возраст
+        by_age = sorted(files, key=lambda f: (_file_age_days(f, today) is None,
+                                              -(_file_age_days(f, today) or 0)))
+        doomed.update(by_age[: max(0, len(files) - keep_max)])
+
+    if not doomed:
+        return 0
+
+    if dry:
+        print(f"[DRY] {label}: удалили бы {len(doomed)} из {len(files)} "
+              f"(осталось бы {len(files) - len(doomed)})", file=sys.stderr)
+        return len(doomed)
+
+    removed = 0
+    for f in sorted(doomed):
+        try:
+            f.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"[WARN] не удалось удалить {f}: {e}", file=sys.stderr)
+    print(f"[OK] {label}: удалено {removed} из {len(files)} "
+          f"(осталось {len(files) - removed})", file=sys.stderr)
+    return removed
+
+
+def _ru_fold(s: str) -> str:
+    """Регистронезависимый ключ сортировки с корректным местом «ё» в русском алфавите
+    (по кодам символов «ё» уходит в конец, после «я»)."""
+    return (s or "").lower().replace("ё", "е")
+
+
+def _natural_key(s: str) -> Tuple:
+    """«Естественная» сортировка, чтобы 9 шло перед 10, а не после 100.
+    Все элементы ключа — однотипные тройки, поэтому сравнение никогда
+    не столкнёт число со строкой."""
+    key = []
+    for part in re.split(r"(\d+)", s or ""):
+        if part.isdigit():
+            key.append((1, int(part), ""))
+        elif part:
+            key.append((0, 0, _ru_fold(part)))
+    return tuple(key)
+
+
+def sort_cards(cards: List[CardInfo]) -> List[CardInfo]:
+    """Сортируем карточки по типу документа в русском алфавитном порядке:
+    ГОСТ (все разновидности) → Письмо → ПНСТ → Постановление → Приказ → …
+    Внутри одного типа — по номеру «естественно» (9 < 10 < 100), затем по наименованию."""
+    return sorted(
+        cards,
+        key=lambda c: (_ru_fold(c.type_str), _natural_key(c.number), _ru_fold(c.name)),
+    )
+
+
 def render_summary_html(cards: List[CardInfo]) -> str:
     chunks = ['<!DOCTYPE html><html><head><meta charset="utf-8"><title>NTD summary</title></head><body>']
     for c in cards:
@@ -736,8 +866,16 @@ def main():
     ap = argparse.ArgumentParser(description="Сборщик новостных карточек NormaCS из HTML-таблиц с обновлениями.")
     ap.add_argument("--input-dir", required=True, help="Папка с HTML-таблицами (YYYYMMDD*.html)")
     ap.add_argument("--from-date", default="2025-09-01", help="Минимальная дата входных таблиц (YYYY-MM-DD | DD.MM.YYYY | YYYYMMDD). Фильтрация по имени файла YYYYMMDD*.html")
+    ap.add_argument("--doc-age-months", type=int, default=None,
+                    help="Отбрасывать документы старше N месяцев. Точка отсчёта — дата "
+                         "отчёта, взятая из имени итогового файла (20260826.html → 2026-08-26); "
+                         "если её не разобрать, берётся сегодняшний день")
     ap.add_argument("--years", default="2025,2026", help="Допустимые годы документов (через запятую). Для стандартов год берётся из обозначения, для остальных — из даты утверждения")
-    ap.add_argument("--out", default=None, help="Путь к итоговому HTML-отчёту")
+    ap.add_argument("--out", default=None,
+                    help="Путь к итоговому HTML-отчёту. Если не задан — имя берётся "
+                         "из самой свежей таблицы в input-dir (20260826.html → out/20260826.html)")
+    ap.add_argument("--out-dir", default="out",
+                    help="Папка для отчёта, когда --out не задан (по умолчанию out)")
     ap.add_argument("--cache-dir", default=".temp/cards", help="Директория кэша карточек")
     ap.add_argument("--done-dir", default=None, help="Куда перекладывать обработанные таблицы; по умолчанию sibling-папка 'done' рядом с input-dir")
     ap.add_argument("--no-move-done", action="store_true", help="Не переносить HTML-таблицы из input-dir в done-dir по завершении")
@@ -752,10 +890,20 @@ def main():
     ap.add_argument("--strict-classifiers", action="store_true", help="Принудительно строгий режим по классификаторам")
     ap.add_argument("--loose-classifiers", action="store_true", help="Не отбрасывать строки без классификаторов даже при непустом classifiers.csv")
     ap.add_argument("--why", action="store_true", help="Пояснять, почему строка отброшена (в stdout)")
+    ap.add_argument("--no-sort", action="store_true", help="Не сортировать карточки (оставить порядок входных таблиц)")
+    ap.add_argument("--prune-days", type=int, default=None,
+                    help="Удалять после прогона карточки в кэше и таблицы в done старше N дней (напр. 30)")
+    ap.add_argument("--keep-cache", type=int, default=None,
+                    help="Оставлять в кэше только N самых свежих карточек")
+    ap.add_argument("--keep-done", type=int, default=None,
+                    help="Оставлять в done только N самых свежих таблиц")
     args = ap.parse_args()
 
     min_date = parse_iso_date(args.from_date)
     allowed_years = parse_years_csv(args.years)
+    if args.doc_age_months is not None and args.doc_age_months < 1:
+        print("[ERR] --doc-age-months должен быть положительным числом", file=sys.stderr)
+        sys.exit(2)
 
     input_dir = Path(args.input_dir)
     done_dir = Path(args.done_dir) if args.done_dir else (input_dir.parent / "done")
@@ -792,17 +940,45 @@ def main():
         print(f"[ERR] В {input_dir} не найдены *.html", file=sys.stderr)
         sys.exit(2)
 
+    # Имя отчёта по самой свежей входной таблице (20260826.html → out/20260826.html).
+    # Свежесть определяем по дате в имени, а не по алфавиту, чтобы «20260720_1»
+    # не обошло «20260826».
+    if not args.out:
+        newest = max(
+            table_files,
+            key=lambda p: (parse_file_date_from_name(p) or date.min, p.stem),
+        )
+        args.out = str(Path(args.out_dir) / f"{newest.stem}.html")
+        print(f"[OK] Имя отчёта взято из таблицы {newest.name} → {args.out}", file=sys.stderr)
+
+    # Дата отчёта = дата из имени итогового файла (20260826.html → 2026-08-26).
+    # От неё отсчитываем возраст документов, поэтому повторный прогон старой
+    # выгрузки даёт тот же результат, что и в день выгрузки.
+    doc_cutoff: Optional[date] = None
+    if args.doc_age_months is not None:
+        report_date = parse_file_date_from_name(Path(args.out)) or date.today()
+        doc_cutoff = months_back(report_date, args.doc_age_months)
+        print(f"[OK] Дата отчёта: {report_date.isoformat()}; отбрасываю документы "
+              f"старше {args.doc_age_months} мес., т.е. до {doc_cutoff.isoformat()}",
+              file=sys.stderr)
+
     strict_mode = (args.strict_classifiers or bool(allowed_labels)) and not args.loose_classifiers
     if args.why:
-        print(f"[DBG] allowed_labels={len(allowed_labels)}, rules={len(rules)}, STRICT={strict_mode}")
+        print(f"[DBG] allowed_labels={len(allowed_labels)}, rules={len(rules)}, STRICT={strict_mode}",
+              file=sys.stderr)
 
     selected_rows: List[Tuple[TableRow, List[str], str]] = []
 
+    # Причины отбраковки копим всегда — итог печатаем в конце,
+    # даже если подробный --why не запрашивали.
+    why_counts: Dict[str, int] = {}
+
     def why(reason: str, row: Optional[TableRow] = None):
+        why_counts[reason] = why_counts.get(reason, 0) + 1
         if args.why:
             src = f" [{row.src_file.name}]" if row else ""
             title = f" — {row.document_title}" if row else ""
-            print(f"[WHY]{src}{title}: {reason}")
+            print(f"[WHY]{src}{title}: {reason}", file=sys.stderr)
 
     # 1) Предфильтр строк таблиц
     for f in table_files:
@@ -849,15 +1025,32 @@ def main():
         to_download = to_download[: args.max]
 
     cards: List[CardInfo] = []
-    for row, mapped_classifiers, doc_type in to_download:
+    total_to_get = len(to_download)
+    n_cached = n_fetched = 0
+    if not args.dry and total_to_get:
+        print(f"[OK] Отобрано карточек: {total_to_get}. Забираю...", file=sys.stderr)
+
+    for i, (row, mapped_classifiers, doc_type) in enumerate(to_download, start=1):
         doc_id = extract_id_from_url(row.url)
         if not doc_id:
             why("не удалось извлечь doc_id", row); continue
         cache_path = cache_dir / f"{doc_id.lower()}.html"
 
         if args.dry:
-            print(f"[DRY] {doc_id} — {row.document_title}")
+            print(f"[DRY] {doc_id} — {row.document_title}", file=sys.stderr)
             continue
+
+        # Показываем, что именно сейчас происходит: из кэша или качаем с сайта
+        from_cache = cache_path.exists()
+        if from_cache:
+            n_cached += 1
+        else:
+            n_fetched += 1
+        short = (row.document_title or "").strip()
+        if len(short) > 70:
+            short = short[:69] + "…"
+        print(f"  [{i}/{total_to_get}] {'из кэша' if from_cache else 'качаю  '} {doc_id} — {short}",
+              file=sys.stderr)
 
         html_text = fetch_with_cache(row.url, cache_path, sleep_sec=args.sleep, timeout=args.timeout)
         if not html_text:
@@ -896,18 +1089,36 @@ def main():
         if allowed_years and (doc_year is None or doc_year not in allowed_years):
             why(f"год документа вне разрешённых: {doc_year}", row); continue
 
+        # Отсекаем документы старше N месяцев от даты отчёта.
+        # Где известна полная дата утверждения — сравниваем по дате;
+        # у стандартов в обозначении есть только год, поэтому там сравниваем
+        # по году и в спорном году документ оставляем.
+        if doc_cutoff is not None:
+            approved = parse_iso_date(card.approved_date) if card.approved_date else None
+            if approved is not None:
+                if approved < doc_cutoff:
+                    why(f"документ старше {args.doc_age_months} мес. "
+                        f"({card.approved_date})", row); continue
+            elif doc_year is not None and doc_year < doc_cutoff.year:
+                why(f"документ старше {args.doc_age_months} мес. (год {doc_year})",
+                    row); continue
+
         cards.append(card)
 
     if args.dry:
-        print(f"[DRY] Всего к скачиванию: {len(to_download)}")
+        print(f"[DRY] Всего к скачиванию: {len(to_download)}", file=sys.stderr)
         return
+
+    if not args.no_sort:
+        cards = sort_cards(cards)
 
     html_out = render_summary_html(cards)
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(html_out, encoding="utf-8")
-        print(f"[OK] Сводный HTML сохранён: {args.out} (карточек: {len(cards)})")
+        print(f"[OK] Сводный HTML сохранён: {args.out} (карточек: {len(cards)})",
+              file=sys.stderr)
     else:
         sys.stdout.write(html_out)
 
@@ -918,6 +1129,29 @@ def main():
         moved = move_processed_tables(table_files, done_dir)
         # Важно: не мусорим в stdout, если HTML выводился в stdout
         print(f"[OK] Перемещено таблиц в done: {moved} → {done_dir}", file=sys.stderr)
+
+    # Чистка «хвостов»: старые карточки в кэше и старые таблицы в done.
+    # Выключено, пока явно не задан хотя бы один лимит.
+    prune_dir(cache_dir, "*.html", args.prune_days, args.keep_cache, "кэш карточек", args.dry)
+    prune_dir(done_dir, "*.html", args.prune_days, args.keep_done, "таблицы в done", args.dry)
+
+    # Итог: что отсеялось и почему. Печатает Python, поэтому кириллица
+    # выводится верно при любой кодовой странице консоли.
+    print("", file=sys.stderr)
+    print("=" * 62, file=sys.stderr)
+    print(f"  Готово: {args.out}", file=sys.stderr)
+    print(f"  Карточек в отчёте: {len(cards)}", file=sys.stderr)
+    print(f"  Получено карточек: {n_cached + n_fetched} "
+          f"(из кэша: {n_cached}, скачано с сайта: {n_fetched})", file=sys.stderr)
+    if why_counts:
+        total_skipped = sum(why_counts.values())
+        print(f"  Пропущено строк: {total_skipped} —", file=sys.stderr)
+        for reason, cnt in sorted(why_counts.items(), key=lambda kv: -kv[1]):
+            print(f"      {cnt:6}  {reason}", file=sys.stderr)
+        if not args.why:
+            print("  (запустите с --why, чтобы увидеть каждую строку поимённо)",
+                  file=sys.stderr)
+    print("=" * 62, file=sys.stderr)
 
 
 
